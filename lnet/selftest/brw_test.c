@@ -88,6 +88,9 @@ brw_client_init(struct sfw_test_instance *tsi)
 	if (len > LNET_MTU)
 		return -EINVAL;
 
+	if (off + len > LNET_MTU)
+		return -EINVAL;
+
 	if (opc != LST_BRW_READ && opc != LST_BRW_WRITE)
 		return -EINVAL;
 
@@ -98,8 +101,9 @@ brw_client_init(struct sfw_test_instance *tsi)
 		return -EINVAL;
 
 	list_for_each_entry(tsu, &tsi->tsi_units, tsu_list) {
-		bulk = srpc_alloc_bulk(lnet_cpt_of_nid(tsu->tsu_dest.nid, NULL),
-				       len);
+		int cpt = lnet_cpt_of_nid(tsu->tsu_dest.nid, NULL);
+
+		bulk = srpc_alloc_bulk(cpt, off + len);
 		if (bulk == NULL) {
 			brw_client_fini(tsi);
 			return -ENOMEM;
@@ -285,7 +289,7 @@ brw_client_prep_rpc(struct sfw_test_unit *tsu, struct lnet_process_id dest,
 		opc   = breq->blk_opc;
 		flags = breq->blk_flags;
 		len   = breq->blk_len;
-		off   = breq->blk_offset;
+		off   = breq->blk_offset & ~PAGE_MASK;
 	}
 	npg   = (off + len + PAGE_SIZE - 1) >> PAGE_SHIFT;
 

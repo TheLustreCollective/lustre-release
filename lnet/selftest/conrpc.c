@@ -1328,6 +1328,8 @@ lstcon_rpc_pinger_stop(void)
 void
 lstcon_rpc_cleanup_wait(void)
 {
+	unsigned long deadline = jiffies +
+				 cfs_time_seconds(2 * LST_TRANS_TIMEOUT);
 	struct lstcon_rpc_trans	*trans;
 	struct lstcon_rpc *crpc;
 	struct list_head *pacer;
@@ -1350,6 +1352,13 @@ lstcon_rpc_cleanup_wait(void)
 
 		mutex_unlock(&console_session.ses_mutex);
 
+		if (time_after(jiffies, deadline)) {
+			CERROR("lst: timed out waiting for transaction cleanup: rc = %d\n",
+			       -ETIMEDOUT);
+			mutex_lock(&console_session.ses_mutex);
+			break;
+		}
+
 		CWARN("Session is shutting down, waiting for termination of transactions\n");
 		schedule_timeout_uninterruptible(cfs_time_seconds(1));
 
@@ -1358,10 +1367,17 @@ lstcon_rpc_cleanup_wait(void)
 
 	spin_lock(&console_session.ses_rpc_lock);
 
-	lst_wait_until((atomic_read(&console_session.ses_rpc_counter) == 0),
+	if (lst_wait_until_timeout(
+			(atomic_read(&console_session.ses_rpc_counter) == 0),
 			console_session.ses_rpc_lock,
-			"Network is not accessable or target is down, waiting for %d console RPCs to being recycled\n",
-			atomic_read(&console_session.ses_rpc_counter));
+			2 * LST_TRANS_TIMEOUT,
+			"Network is not accessible or target is down, waiting for %d console RPCs to be recycled\n",
+			atomic_read(&console_session.ses_rpc_counter))) {
+
+		CERROR("lst: timed out waiting for %d console RPCs: rc = %d\n",
+		       atomic_read(&console_session.ses_rpc_counter),
+		       -ETIMEDOUT);
+	}
 
 	list_splice_init(&console_session.ses_rpc_freelist, &zlist);
 

@@ -206,6 +206,184 @@ test_smoke () {
 }
 run_test smoke "lst regression test"
 
+# Test rapid session create/destroy cycles with active BRW traffic.
+# Reproduces LU-20104 session teardown deadlock: orphaned server RPCs on
+# scd_rpc_active list, improper batch drain ordering in sfw_remove_session,
+# and zombie session destroy from workitem context (cancel_work_sync
+# deadlock on same workqueue).
+test_teardown () {
+	lst_prepare
+
+	local servers=$lst_SERVERS
+	local clients=$lst_CLIENTS
+	local nc=$(echo ${clients//,/ } | wc -w)
+	local ns=$(echo ${servers//,/ } | wc -w)
+	local cycles=5
+	local rc=0
+
+	for i in $(seq $cycles); do
+		echo "=== Teardown cycle $i/$cycles ==="
+		export LST_SESSION=$$
+
+		$LST new_session --timeo 100000 teardown_$i
+		$LST add_group c $(nids_list $clients)
+		$LST add_group s $(nids_list $servers)
+		$LST add_batch b
+
+		$LST add_test --batch b --loop 5000 --concurrency 8 \
+			--distribute ${nc}:${ns} --from c --to s \
+			brw write $check size=1M
+		$LST add_test --batch b --loop 5000 --concurrency 8 \
+			--distribute ${nc}:${ns} --from c --to s \
+			ping
+
+		$LST run b
+		sleep 2
+
+		# end_session must complete without deadlock
+		timeout 60 $LST end_session --verbose
+		rc=$?
+		if [ $rc -eq 124 ]; then
+			error "session teardown deadlocked on cycle $i"
+		fi
+		[ $rc -eq 0 ] || error "end_session failed on cycle $i: rc=$rc"
+	done
+
+	lst_cleanup_all
+}
+run_test teardown "lst session teardown stress (LU-20104)"
+
+# Test BRW with non-zero offsets. Reproduces LU-20104 offset handling bugs:
+# 1) brw_client_prep_rpc did not mask offset with ~PAGE_MASK
+# 2) brw_client_init allocated bulk without accounting for offset
+# 3) No validation that off+len <= LNET_MTU
+# On unpatched kernels, off=4096 causes LBUG (nblk != bk_niov) and
+# off=2048 size=1M causes NULL page dereference or LASSERT failure.
+test_brw_offset () {
+	lst_prepare
+
+	local servers=$lst_SERVERS
+	local clients=$lst_CLIENTS
+	local nc=$(echo ${clients//,/ } | wc -w)
+	local ns=$(echo ${servers//,/ } | wc -w)
+	local log=$TMP/$tfile.log
+	local rc=0
+
+	export LST_SESSION=$$
+
+	$LST new_session --timeo 100000 brw_offset
+	$LST add_group c $(nids_list $clients)
+	$LST add_group s $(nids_list $servers)
+
+	# Valid offsets with various sizes
+	for off in 0 512 1024 2048; do
+		for size in 4k 64k; do
+			echo "=== BRW read off=$off size=$size ==="
+			$LST add_batch b_r_${off}_${size}
+			$LST add_test --batch b_r_${off}_${size} \
+				--concurrency 4 \
+				--distribute ${nc}:${ns} \
+				--from c --to s \
+				brw read $check size=$size off=$off
+			$LST run b_r_${off}_${size}
+			$LST stat --delay 1 --count 10 --timeout 5 c s \
+				| tee -a $log
+			$LST stop b_r_${off}_${size}
+		done
+	done
+
+	# offset >= PAGE_SIZE triggers nblk mismatch in
+	# sfw_create_test_rpc when prep_rpc doesn't mask offset
+	echo "=== BRW read off=4096 size=4k (PAGE_SIZE offset) ==="
+	$LST add_batch b_page
+	$LST add_test --batch b_page \
+		--concurrency 4 \
+		--distribute ${nc}:${ns} --from c --to s \
+		brw read $check size=4k off=4096
+	$LST run b_page
+	$LST stat --delay 1 --count 10 --timeout 5 c s | tee -a $log
+	$LST stop b_page
+
+	# off + len > LNET_MTU exceeds LNET_MAX_IOV pages,
+	# should return error and avoid NULL page dereference
+	# in srpc_init_bulk
+	echo "=== BRW write off=2048 size=1M (off+len > LNET_MTU) ==="
+	$LST add_batch b_overflow
+	$LST add_test --batch b_overflow \
+		--concurrency 2 \
+		--distribute ${nc}:${ns} --from c --to s \
+		brw write $check size=1M off=2048 && \
+		error "off=2048 size=1M should have been rejected"
+
+	lst_end_session --verbose | tee -a $log
+	check_lst_err $log
+	lst_cleanup_all
+}
+run_test brw_offset "lst BRW offset handling (LU-20104)"
+
+# Reproduces the LU-20104 workqueue list-corruption race: server-side
+# srpc_handle_rpc's abort/shutdown branch calls LNetMDUnlink on the bulk
+# and reply MDs after setting wi->swi_state=DONE; the resulting UNLINK
+# events run srpc_lnet_ev_handler, which sets ev_fired and calls
+# queue_work on the same srpc_wi that's still executing. On the same
+# pass through srpc_server_rpc_done the recycle path used to call
+# INIT_WORK on a work_struct still pending in the workqueue's list,
+# corrupting it ("list_add corruption. prev->next should be next ...").
+#
+# To hit that race reliably we want:
+#   * many in-flight bulk MDs (high concurrency, both directions) so the
+#     abort path has many MDs to LNetMDUnlink in close succession,
+#   * end_session called while traffic is still ramping (no settle
+#     sleep) so MDs are actively in-flight rather than drained,
+#   * many cycles to keep rolling the dice.
+test_teardown_race () {
+	lst_prepare
+
+	local servers=$lst_SERVERS
+	local clients=$lst_CLIENTS
+	local nc=$(echo ${clients//,/ } | wc -w)
+	local ns=$(echo ${servers//,/ } | wc -w)
+	local cycles=${LST_TEARDOWN_RACE_CYCLES:-20}
+	local rc=0
+
+	for i in $(seq $cycles); do
+		echo "=== Teardown-race cycle $i/$cycles ==="
+		export LST_SESSION=$$
+
+		$LST new_session --timeo 100000 teardown_race_$i
+		$LST add_group c $(nids_list $clients)
+		$LST add_group s $(nids_list $servers)
+		$LST add_batch b
+
+		# bidirectional brw + ping at high concurrency: maximises the
+		# number of bulk + reply MDs the abort path must LNetMDUnlink
+		# while the worker is still running srpc_handle_rpc.
+		$LST add_test --batch b --loop 10000 --concurrency 32 \
+			--distribute ${nc}:${ns} --from c --to s \
+			brw write $check size=1M
+		$LST add_test --batch b --loop 10000 --concurrency 32 \
+			--distribute ${nc}:${ns} --from c --to s \
+			brw read $check size=1M
+		$LST add_test --batch b --loop 10000 --concurrency 32 \
+			--distribute ${nc}:${ns} --from c --to s \
+			ping
+
+		$LST run b
+		# No settle sleep: end_session must hit while MDs are
+		# actively in flight, not after they've drained.
+
+		timeout 60 $LST end_session --verbose
+		rc=$?
+		if [ $rc -eq 124 ]; then
+			error "end_session deadlocked on cycle $i"
+		fi
+		[ $rc -eq 0 ] || error "end_session failed on cycle $i: rc=$rc"
+	done
+
+	lst_cleanup_all
+}
+run_test teardown_race "lst teardown wq list-corruption race (LU-20104)"
+
 complete_test $SECONDS
 _restore_mount
 check_and_cleanup_lustre

@@ -113,6 +113,97 @@ static struct srpc_service sfw_services[] = {
 static int sfw_stop_batch(struct sfw_batch *tsb, int force);
 static void sfw_destroy_session(struct sfw_session *sn);
 
+/*
+ * Check if any test service has active server-side RPCs.
+ */
+static bool
+sfw_test_services_idle(void)
+{
+	struct sfw_test_case *tsc;
+	struct srpc_service_cd *scd;
+	int i;
+
+	list_for_each_entry(tsc, &sfw_data.fw_tests, tsc_list) {
+		struct srpc_service *sv = tsc->tsc_srv_service;
+
+		cfs_percpt_for_each(scd, i, sv->sv_cpt_data) {
+			spin_lock(&scd->scd_lock);
+			if (!list_empty(&scd->scd_rpc_active)) {
+				spin_unlock(&scd->scd_lock);
+				return false;
+			}
+			spin_unlock(&scd->scd_lock);
+		}
+	}
+
+	return true;
+}
+
+/*
+ * Wait for client-side batches to become inactive.
+ * Called before sfw_deactivate_session() while the session is still valid.
+ * Bounded by twice the RPC timeout.
+ */
+static void
+sfw_wait_batches_idle(struct sfw_session *sn)
+{
+	unsigned long deadline = jiffies + cfs_time_seconds(2 * rpc_timeout);
+	struct sfw_batch *tsb;
+
+	while (1) {
+		bool idle = true;
+
+		spin_lock(&sfw_data.fw_lock);
+		list_for_each_entry(tsb, &sn->sn_batches, bat_list) {
+			if (sfw_batch_active(tsb))
+				idle = false;
+		}
+		spin_unlock(&sfw_data.fw_lock);
+
+		if (idle)
+			break;
+
+		if (time_after(jiffies, deadline)) {
+			CERROR("lst: timed out waiting for batches to drain: rc = %d\n",
+			       -ETIMEDOUT);
+			break;
+		}
+
+		schedule_timeout_uninterruptible(cfs_time_seconds(1) / 10);
+	}
+}
+
+/*
+ * Wait for server-side test service RPCs to drain.
+ * Called after sfw_deactivate_session() — does not access session pointer.
+ * Bounded by twice the RPC timeout.
+ *
+ * Re-aborts test services on each iteration to catch RPCs that arrived
+ * after the initial abort sweep (see comment in srpc_abort_service about
+ * racing with incoming RPCs).
+ */
+static void
+sfw_wait_services_idle(void)
+{
+	unsigned long deadline = jiffies + cfs_time_seconds(2 * rpc_timeout);
+
+	while (!sfw_test_services_idle()) {
+		struct sfw_test_case *tsc;
+
+		if (time_after(jiffies, deadline)) {
+			CERROR("lst: timed out waiting for test services to drain: rc = %d\n",
+			       -ETIMEDOUT);
+			break;
+		}
+
+		/* Re-abort to catch RPCs that arrived after initial abort */
+		list_for_each_entry(tsc, &sfw_data.fw_tests, tsc_list)
+			srpc_abort_service(tsc->tsc_srv_service);
+
+		schedule_timeout_uninterruptible(cfs_time_seconds(1) / 10);
+	}
+}
+
 static inline struct sfw_test_case *
 sfw_find_test_case(enum srpc_service_type id)
 {
@@ -486,6 +577,7 @@ sfw_remove_session(struct srpc_rmsn_reqst *request,
 		   struct srpc_rmsn_reply *reply)
 {
 	struct sfw_session *sn = sfw_data.fw_session;
+	struct sfw_batch *tsb;
 
 	reply->rmsn_sid = get_old_sid(sn);
 
@@ -504,9 +596,27 @@ sfw_remove_session(struct srpc_rmsn_reqst *request,
 		return 0;
 	}
 
+	/* Stop client-side batches and wait for them to drain while
+	 * the session is still valid.
+	 */
+	spin_lock(&sfw_data.fw_lock);
+	list_for_each_entry(tsb, &sn->sn_batches, bat_list) {
+		if (sfw_batch_active(tsb))
+			sfw_stop_batch(tsb, 1);
+	}
+	spin_unlock(&sfw_data.fw_lock);
+
+	sfw_wait_batches_idle(sn);
+
+	/* Now deactivate the session (aborts server-side RPCs, zombifies
+	 * the session).  After this, sn may be freed at any time.
+	 */
 	spin_lock(&sfw_data.fw_lock);
 	sfw_deactivate_session();
 	spin_unlock(&sfw_data.fw_lock);
+
+	/* Wait for server-side test service RPCs to drain. */
+	sfw_wait_services_idle();
 
 	reply->rmsn_status = 0;
 	reply->rmsn_sid = get_old_sid(NULL);
@@ -647,7 +757,8 @@ sfw_destroy_test_instance(struct sfw_test_instance *tsi)
 
 	while (!list_empty(&tsi->tsi_free_rpcs)) {
 		rpc = list_first_entry(&tsi->tsi_free_rpcs,
-				       struct srpc_client_rpc, crpc_list);
+				       struct srpc_client_rpc,
+				       crpc_list);
 		list_del(&rpc->crpc_list);
 		swi_cancel_workitem(&rpc->crpc_wi);
 		LIBCFS_FREE(rpc, srpc_client_rpc_size(rpc));
