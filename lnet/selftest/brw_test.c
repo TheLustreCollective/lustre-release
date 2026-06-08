@@ -92,7 +92,9 @@ brw_client_init(struct sfw_test_instance *tsi)
 		return -EINVAL;
 
 	if (flags != LST_BRW_CHECK_NONE &&
-	    flags != LST_BRW_CHECK_FULL && flags != LST_BRW_CHECK_SIMPLE)
+	    flags != LST_BRW_CHECK_FULL &&
+	    flags != LST_BRW_CHECK_SIMPLE &&
+	    flags != LST_BRW_CHECK_DISCARD)
 		return -EINVAL;
 
 	list_for_each_entry(tsu, &tsi->tsi_units, tsu_list) {
@@ -103,6 +105,7 @@ brw_client_init(struct sfw_test_instance *tsi)
 			return -ENOMEM;
 		}
 		srpc_init_bulk(bulk, off, len, opc == LST_BRW_READ);
+		bulk->bk_discard = (flags == LST_BRW_CHECK_DISCARD);
 
 		tsu->tsu_private = bulk;
 	}
@@ -138,7 +141,7 @@ brw_fill_page(struct page *pg, int off, int len, int pattern, __u64 magic)
 	LASSERT(addr != NULL);
 	LASSERT(off % BRW_MSIZE == 0 && len % BRW_MSIZE == 0);
 
-	if (pattern == LST_BRW_CHECK_NONE)
+	if (pattern == LST_BRW_CHECK_NONE || pattern == LST_BRW_CHECK_DISCARD)
 		return;
 
 	if (magic == BRW_MAGIC)
@@ -171,7 +174,7 @@ brw_check_page(struct page *pg, int off, int len, int pattern, __u64 magic)
 	LASSERT(addr != NULL);
 	LASSERT(off % BRW_MSIZE == 0 && len % BRW_MSIZE == 0);
 
-	if (pattern == LST_BRW_CHECK_NONE)
+	if (pattern == LST_BRW_CHECK_NONE || pattern == LST_BRW_CHECK_DISCARD)
 		return 0;
 
 	if (pattern == LST_BRW_CHECK_SIMPLE) {
@@ -435,7 +438,8 @@ brw_server_handle(struct srpc_server_rpc *rpc)
 	if ((reqst->brw_rw != LST_BRW_READ && reqst->brw_rw != LST_BRW_WRITE) ||
 	    (reqst->brw_flags != LST_BRW_CHECK_NONE &&
 	     reqst->brw_flags != LST_BRW_CHECK_FULL &&
-	     reqst->brw_flags != LST_BRW_CHECK_SIMPLE)) {
+	     reqst->brw_flags != LST_BRW_CHECK_SIMPLE &&
+	     reqst->brw_flags != LST_BRW_CHECK_DISCARD)) {
 		reply->brw_status = EINVAL;
 		return 0;
 	}
@@ -463,6 +467,7 @@ brw_server_handle(struct srpc_server_rpc *rpc)
 
 	srpc_init_bulk(rpc->srpc_bulk, 0, reqst->brw_len,
 		       reqst->brw_rw == LST_BRW_WRITE);
+	rpc->srpc_bulk->bk_discard = (reqst->brw_flags == LST_BRW_CHECK_DISCARD);
 
 	if (reqst->brw_rw == LST_BRW_READ)
 		brw_fill_bulk(rpc->srpc_bulk, reqst->brw_flags, BRW_MAGIC);

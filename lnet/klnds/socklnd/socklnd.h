@@ -309,6 +309,7 @@ struct ksock_conn {
 	unsigned int		ksnc_closing:1;		/* being shut down */
 	unsigned int		ksnc_flip:1;		/* flip or not, only for V2.x */
 	unsigned int		ksnc_zc_capable:1;	/* enable to ZC */
+	unsigned int		ksnc_rx_discard:1;	/* discard incoming payload */
 	const struct ksock_proto *ksnc_proto; /* protocol for the connection */
 
 	/* READER */
