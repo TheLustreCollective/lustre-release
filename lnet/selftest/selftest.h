@@ -246,6 +246,7 @@ struct srpc_server_rpc {
 	struct srpc_bulk       *srpc_bulk;
 
 	unsigned int	srpc_aborted; /* being given up */
+	unsigned int	srpc_completed; /* completion sentinel */
 	int		srpc_status;
 	void		(*srpc_done)(struct srpc_server_rpc *);
 };
@@ -558,6 +559,8 @@ static inline int
 swi_cancel_workitem(struct swi_workitem *swi)
 {
 	swi->swi_state = SWI_STATE_DONE;
+	if (current_work() == &swi->swi_work)
+		return 0;
 	return cancel_work_sync(&swi->swi_work);
 }
 
