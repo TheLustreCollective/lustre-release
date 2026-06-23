@@ -15660,6 +15660,41 @@ test_119q()
 }
 run_test 119q "Test patchded Unaligned DIO readv() and writev()"
 
+test_119r() {
+	unaligned_dio_or_skip
+
+	# Test error handling in unaligned DIO user copy with racing threads
+	local file=$DIR/$tfile
+
+	$LFS setstripe -c 2 $file || error "setstripe failed"
+	stack_trap "rm -f $file"
+
+	# Create a file with some data
+	dd if=/dev/urandom of=$file bs=1M count=1 || error "dd failed"
+
+	# Set fail_loc to inject error in DIO copy
+	#define OBD_FAIL_LLITE_DIO_COPY_ERR		    0x1437
+	$LCTL set_param fail_loc=0x1437
+	stack_trap "$LCTL set_param fail_loc=0"
+
+	# Use rwv to do unaligned DIO write at offset 1024 with size 4096
+	# This is unaligned because offset 1024 is not page-aligned
+	local output
+	output=$(rwv -f $file -Dw -n 1 1024 4096 2>&1) &&
+		error "Unaligned DIO write should have failed but succeeded"
+
+	echo "$output" | grep -q "Bad address" ||
+		error "Expected 'Bad address' error, got: $output"
+
+	# Clear fail_loc
+	$LCTL set_param fail_loc=0
+
+	# Verify normal aligned DIO works after error
+	dd if=/dev/zero of=$file bs=4096 count=1 oflag=direct ||
+		error "DIO write failed after clearing fail_loc"
+}
+run_test 119r "Test error handling in unaligned DIO user copy"
+
 test_120a() {
 	[ $PARALLEL == "yes" ] && skip "skip parallel run"
 	remote_mds_nodsh && skip "remote MDS with nodsh"
@@ -30748,6 +30783,64 @@ test_398s() {
 	return 0
 }
 run_test 398s "i/o error on mirror file read"
+
+test_398t() { # LU-19536
+	unaligned_dio_or_skip
+
+	$LFS setstripe -c 1 $DIR/$tfile || error "setstripe failed"
+
+	# Use a non-page-aligned block size to trigger unaligned
+	# DIO path. The fail_loc makes ll_allocate_dio_buffer
+	# fail after allocating the pages array, exercising the
+	# cleanup path which had a double-free bug.
+#define OBD_FAIL_LLITE_DIO_BUFFER_ALLOC       0x1438
+	$LCTL set_param fail_loc=0x80001438
+
+	dd if=/dev/zero of=$DIR/$tfile bs=1024 count=64 oflag=direct 2>/dev/null
+
+	$LCTL set_param fail_loc=0
+	# write may fail or succeed (if retried), but must not crash
+
+	# verify the system is still functional
+	echo "sanity check" > $DIR/$tfile || error "write after fail_loc failed"
+}
+run_test 398t "DIO buffer alloc failure must not crash (double-free)"
+
+test_398u() { # LU-19536
+	unaligned_dio_or_skip
+
+	# Force ENOMEM mid-IO to exercise the drain+retry path.
+	#
+	# OBD_FAIL_LLITE_DIO_DRAIN_RETRY (0x1439) does two things:
+	# 1) PRECHECK caps each sub_dio to PAGE_SIZE, so a single
+	#    write() generates many loop iterations with in-flight
+	#    sub_dios.
+	# 2) CFS_FAIL_CHECK with SKIP|ONCE triggers ENOMEM in
+	#    ll_allocate_dio_buffer after fail_val successes.
+	#
+	# With fail_val=5, iterations 1-5 succeed (tot_bytes > 0),
+	# iteration 6 gets ENOMEM, and the drain+retry path fires.
+	$LFS setstripe -c -1 $DIR/$tfile || error "setstripe"
+#define OBD_FAIL_LLITE_DIO_DRAIN_RETRY        0x1439
+	$LCTL set_param fail_loc=0xa0001439 fail_val=5
+
+	# bs=4608 (4096+512): not page-aligned but 512-aligned for
+	# O_DIRECT.  write 1 at offset 0 is page-aligned (regular
+	# DIO), write 2 at offset 4608 is unaligned.  With sub_dios
+	# capped to PAGE_SIZE, each unaligned write generates 2 loop
+	# iterations (4096+512), so 3 unaligned writes = 6 alloc
+	# calls.  fail_val=5 skips 5, fails the 6th — at which
+	# point tot_bytes > 0 (one iteration succeeded in this
+	# call), so drain+retry fires.
+	dd if=/dev/zero of=$DIR/$tfile bs=4608 count=10 \
+		oflag=direct || error "dd with drain retry failed"
+	$LCTL set_param fail_loc=0
+
+	local sz=$(stat -c %s $DIR/$tfile)
+	(( sz == 10 * 4608 )) ||
+		error "file size $sz != expected $((10 * 4608))"
+}
+run_test 398u "DIO pool ENOMEM triggers drain and retry"
 
 test_fake_rw() {
 	local read_write=$1
