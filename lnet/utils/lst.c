@@ -3517,6 +3517,8 @@ lst_get_bulk_param(int argc, char **argv, struct lst_test_bulk_param *bulk)
 				bulk->blk_flags = LST_BRW_CHECK_FULL;
 			} else if (strcasecmp(tok, "simple") == 0) {
 				bulk->blk_flags = LST_BRW_CHECK_SIMPLE;
+			} else if (strcasecmp(tok, "discard") == 0) {
+				bulk->blk_flags = LST_BRW_CHECK_DISCARD;
 			} else {
 				fprintf(stderr, "Unknow flag %s\n", tok);
 				return -1;
@@ -3574,6 +3576,10 @@ lst_get_bulk_param(int argc, char **argv, struct lst_test_bulk_param *bulk)
 		} else if (strcasecmp(argv[i], "write") == 0 ||
 			   strcasecmp(argv[i], "w") == 0) {
 			bulk->blk_opc = LST_BRW_WRITE;
+
+		} else if (strcasecmp(argv[i], "skip_rx_copy") == 0 ||
+			   strcasecmp(argv[i], "skip-rx-copy") == 0) {
+			bulk->blk_flags = LST_BRW_CHECK_DISCARD;
 
 		} else {
 			fprintf(stderr, "Unknow parameter: %s\n", argv[i]);

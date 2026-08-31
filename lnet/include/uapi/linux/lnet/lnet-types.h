@@ -484,6 +484,7 @@ enum lnet_md_options {
 	LNET_MD_NO_TRACK_RESPONSE = 0x0800,
 	LNET_MD_GNILND		= 0x1000,
 	LNET_MD_GPU_ADDR	= 0x2000,
+	LNET_MD_DISCARD		= 0x4000,
 };
 
 /** Infinite threshold on MD operations. See struct lnet_md::threshold */

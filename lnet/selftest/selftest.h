@@ -206,6 +206,7 @@ struct srpc_bulk {
 	int			bk_len;  /* len of bulk data */
 	struct lnet_handle_md	bk_mdh;
 	int			bk_sink; /* sink/source */
+	int			bk_discard; /* discard received data? */
 	int			bk_alloc; /* # allocated iov */
 	int			bk_niov; /* # iov in bk_iovs */
 	struct bio_vec		bk_iovs[];
@@ -236,7 +237,8 @@ struct srpc_server_rpc {
 	struct list_head	srpc_list;
 	struct srpc_service_cd *srpc_scd;
 	struct swi_workitem	srpc_wi;
-	struct srpc_event	srpc_ev;	/* bulk/reply event */
+	struct srpc_event	srpc_bulkev;	/* bulk MD event */
+	struct srpc_event	srpc_replyev;	/* reply MD event */
 	lnet_nid_t		srpc_self;
 	struct lnet_process_id	srpc_peer;
 	struct srpc_msg		srpc_replymsg;
@@ -245,6 +247,7 @@ struct srpc_server_rpc {
 	struct srpc_bulk       *srpc_bulk;
 
 	unsigned int	srpc_aborted; /* being given up */
+	unsigned int	srpc_completed; /* completion sentinel */
 	int		srpc_status;
 	void		(*srpc_done)(struct srpc_server_rpc *);
 };
@@ -547,6 +550,18 @@ swi_init_workitem(struct swi_workitem *swi,
 	INIT_WORK(&swi->swi_work, swi_wi_action);
 }
 
+/* Reset workitem state for reuse without touching the underlying
+ * work_struct.  INIT_WORK on a still-queued work corrupts the
+ * workqueue's worklist, so the work_struct must be initialised once
+ * via swi_init_workitem() at allocation time and only reset here on
+ * subsequent reuse.
+ */
+static inline void
+swi_reset_workitem(struct swi_workitem *swi)
+{
+	swi->swi_state = SWI_STATE_NEWBORN;
+}
+
 static inline void
 swi_schedule_workitem(struct swi_workitem *wi)
 {
@@ -557,6 +572,8 @@ static inline int
 swi_cancel_workitem(struct swi_workitem *swi)
 {
 	swi->swi_state = SWI_STATE_DONE;
+	if (current_work() == &swi->swi_work)
+		return 0;
 	return cancel_work_sync(&swi->swi_work);
 }
 
@@ -650,6 +667,28 @@ do {									\
 		spin_lock(&(lock));					\
 	}								\
 } while (0)
+
+#define lst_wait_until_timeout(cond, lock, timeout, fmt, ...)		\
+({									\
+	unsigned long __deadline = jiffies + cfs_time_seconds(timeout);	\
+	int __I = 2;							\
+	bool __expired = false;						\
+	while (!(cond)) {						\
+		if (time_after(jiffies, __deadline)) {			\
+			__expired = true;				\
+			break;						\
+		}							\
+		CDEBUG_LIMIT(is_power_of_2(++__I) ? D_WARNING : D_NET,	\
+		       fmt, ## __VA_ARGS__);				\
+		spin_unlock(&(lock));					\
+									\
+		schedule_timeout_uninterruptible(			\
+			cfs_time_seconds(1) / 10);			\
+									\
+		spin_lock(&(lock));					\
+	}								\
+	__expired;							\
+})
 
 static inline void
 srpc_wait_service_shutdown(struct srpc_service *sv)

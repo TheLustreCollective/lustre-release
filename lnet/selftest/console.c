@@ -1734,6 +1734,33 @@ int lstcon_session_end(void)
 
 	LASSERT(console_session.ses_state == LST_SESSION_ACTIVE);
 
+	/* Stop all active batches before ending the session.
+	 * This sends SRPC_BATCH_OPC_STOP to all nodes, which aborts
+	 * in-flight test RPCs and waits for them to drain.  Without
+	 * this, end_session hits active bulk transfers on servers.
+	 */
+	list_for_each_entry(bat, &console_session.ses_bat_list, bat_link) {
+		if (bat->bat_state != LST_BATCH_IDLE) {
+			struct lstcon_rpc_trans *stop_trans;
+
+			bat->bat_arg = 1; /* force */
+			rc = lstcon_rpc_trans_ndlist(&bat->bat_cli_list,
+						     &bat->bat_trans_list,
+						     LST_TRANS_TSBSTOP, bat,
+						     lstcon_batrpc_condition,
+						     &stop_trans);
+			if (rc == 0) {
+				lstcon_rpc_trans_postwait(stop_trans,
+							 LST_TRANS_TIMEOUT);
+				lstcon_rpc_trans_destroy(stop_trans);
+			} else {
+				CERROR("lst-console: can't create batch stop transaction: rc = %d\n",
+				       rc);
+			}
+			bat->bat_state = LST_BATCH_IDLE;
+		}
+	}
+
 	rc = lstcon_rpc_trans_ndlist(&console_session.ses_ndl_list, NULL,
 				     LST_TRANS_SESEND, NULL,
 				     lstcon_sesrpc_condition, &trans);
