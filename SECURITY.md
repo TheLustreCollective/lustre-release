@@ -14,7 +14,7 @@ The currently supported maintenance release is 2.15.
 ## Reporting a Vulnerability
 
 If you have details of a suspected security vulnerability in Lustre code that you
-wish to report then please email us at security@whamcloud.com with the details.
+wish to report then please email us at security@thelustrecollective.com with the details.
 
 Please do not file a public JIRA issue for a security vulnerability - we do not want
 to draw attention to the vulnerability until a fix has been developed and administrators
